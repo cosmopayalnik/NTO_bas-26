@@ -1,0 +1,398 @@
+import cv2
+import numpy as np
+import math
+import time
+
+class FastDroneDetector:
+    H_MIN = 20
+    H_MAX = 35
+    S_MIN = 100
+    S_MAX = 255
+    V_MIN = 100
+    V_MAX = 255
+    YELLOW_AREA_MIN = 50
+    YELLOW_AREA_MAX = 6000
+    YELLOW_KERNEL = 2
+    YELLOW_DILATE = 5
+    YELLOW_ERODE = 0
+    
+    BLACK_THRESH_MIN = 36
+    BLACK_THRESH_MAX = 71
+    RING_AREA_MIN = 8000
+    RING_KERNEL = 5
+    RING_CIRCULARITY_MIN = 0.05
+    RING_SOLIDITY_MIN = 0.05
+    RING_DILATE_ITER = 4
+    RING_ERODE_ITER = 3
+    USE_ADAPTIVE = False
+    
+    def __init__(self):
+        self.zero_roll = 0.0
+        self.zero_pitch = 0.0
+        self.roll_zero_set = False
+        self.pitch_zero_set = False
+        self.paused = False
+        self.last_roll = 0.0
+        self.last_pitch = 0.0
+        self.last_update_time = 0
+    
+    @staticmethod
+    def normalize_angle(angle):
+        while angle > 180:
+            angle -= 360
+        while angle < -180:
+            angle += 360
+        return angle
+    
+    def detect_rings_improved(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        
+        mask1 = cv2.inRange(gray, self.BLACK_THRESH_MIN, self.BLACK_THRESH_MAX)
+        
+        kernel = np.ones((self.RING_KERNEL, self.RING_KERNEL), np.uint8)
+        mask1 = cv2.morphologyEx(mask1, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask1 = cv2.morphologyEx(mask1, cv2.MORPH_OPEN, kernel, iterations=1)
+        
+        mask1 = cv2.dilate(mask1, kernel, iterations=self.RING_DILATE_ITER)
+        mask1 = cv2.erode(mask1, kernel, iterations=self.RING_ERODE_ITER)
+        
+        contours_temp, _ = cv2.findContours(mask1, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        mask_filled = np.zeros_like(mask1)
+        for cnt in contours_temp:
+            if cv2.contourArea(cnt) > self.RING_AREA_MIN:
+                cv2.drawContours(mask_filled, [cnt], -1, 255, -1)
+        
+        mask_combined = mask_filled
+        
+        contours, _ = cv2.findContours(mask_combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        ring_candidates = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            
+            if area > self.RING_AREA_MIN:
+                M = cv2.moments(cnt)
+                if M["m00"] != 0:
+                    cX = int(M["m10"] / M["m00"])
+                    cY = int(M["m01"] / M["m00"])
+                    
+                    (x, y), radius = cv2.minEnclosingCircle(cnt)
+                    
+                    perimeter = cv2.arcLength(cnt, True)
+                    circularity = 4 * math.pi * (area / (perimeter * perimeter)) if perimeter > 0 else 0
+                    
+                    hull = cv2.convexHull(cnt)
+                    hull_area = cv2.contourArea(hull)
+                    solidity = float(area) / hull_area if hull_area > 0 else 0
+                    
+                    if area > self.RING_AREA_MIN:
+                        ring_candidates.append({
+                            'center': (int(x), int(y)),
+                            'radius': int(radius),
+                            'area': area,
+                            'circularity': circularity,
+                            'solidity': solidity,
+                            'contour': cnt
+                        })
+        
+        ring_candidates.sort(key=lambda x: x['area'], reverse=True)
+        
+        ring_centers = []
+        for ring in ring_candidates[:2]:
+            ring_centers.append(ring['center'])
+        
+        return ring_centers, mask_combined, ring_candidates
+
+    def detect_yellow_connectors(self, frame):
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        lower = np.array([self.H_MIN, self.S_MIN, self.V_MIN])
+        upper = np.array([self.H_MAX, self.S_MAX, self.V_MAX])
+        mask = cv2.inRange(hsv, lower, upper)
+        
+        mask = cv2.GaussianBlur(mask, (3, 3), 0)
+        
+        kernel = np.ones((self.YELLOW_KERNEL, self.YELLOW_KERNEL), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.dilate(mask, kernel, iterations=self.YELLOW_DILATE)
+        mask = cv2.erode(mask, kernel, iterations=self.YELLOW_ERODE)
+        
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        connectors = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            
+            if self.YELLOW_AREA_MIN < area < self.YELLOW_AREA_MAX:
+                perimeter = cv2.arcLength(cnt, True)
+                if perimeter > 0:
+                    circularity = 4 * math.pi * (area / (perimeter * perimeter))
+                    
+                    M = cv2.moments(cnt)
+                    if M["m00"] != 0:
+                        cX = int(M["m10"] / M["m00"])
+                        cY = int(M["m01"] / M["m00"])
+                        
+                        if circularity > 0.2:
+                            connectors.append([cX, cY])
+        
+        return connectors, mask
+
+    def set_zero_roll(self, current_roll):
+        self.zero_roll = current_roll
+        self.roll_zero_set = True
+        print(f"✅ ROLL ZERO SET: {current_roll:.2f}°")
+
+    def set_zero_pitch(self, current_pitch):
+        self.zero_pitch = current_pitch
+        self.pitch_zero_set = True
+        print(f"✅ PITCH ZERO SET: {current_pitch:.2f}°")
+
+    def get_corrected_roll(self, raw_roll):
+        if not self.roll_zero_set:
+            return raw_roll
+        corrected = raw_roll - self.zero_roll
+        return self.normalize_angle(corrected)
+
+    def get_corrected_pitch(self, raw_pitch):
+        if not self.pitch_zero_set:
+            return raw_pitch
+        corrected = raw_pitch - self.zero_pitch
+        return self.normalize_angle(corrected)
+
+    def process_frame(self, frame):
+        ring_centers, mask_black, ring_candidates = self.detect_rings_improved(frame)
+        connectors, mask_yellow = self.detect_yellow_connectors(frame)
+        
+        h, w = frame.shape[:2]
+        current_time = time.time()
+        
+        # PITCH
+        raw_pitch = 0.0
+        has_pitch_data = False
+        if len(ring_centers) >= 2:
+            dx = ring_centers[1][0] - ring_centers[0][0]
+            dy = ring_centers[1][1] - ring_centers[0][1]
+            if abs(dy) > 10 or abs(dx) > 10:
+                raw_pitch = self.normalize_angle(math.degrees(math.atan2(dx, dy)))
+                has_pitch_data = True
+                self.last_pitch = self.get_corrected_pitch(raw_pitch)
+        
+        # ROLL
+        raw_roll = 0.0
+        has_roll_data = False
+        p1, p2 = None, None
+        
+        if len(connectors) >= 2:
+            max_dist = 0
+            for i in range(len(connectors)):
+                for j in range(i+1, len(connectors)):
+                    d = np.linalg.norm(np.array(connectors[i]) - np.array(connectors[j]))
+                    if d > max_dist:
+                        max_dist = d
+                        p1, p2 = connectors[i], connectors[j]
+            
+            if p1 and p2:
+                dx = p2[0] - p1[0]
+                dy = p2[1] - p1[1]
+                drone_angle = self.normalize_angle(math.degrees(math.atan2(dy, dx)))
+                
+                if has_pitch_data:
+                    raw_roll = self.normalize_angle(drone_angle - raw_pitch)
+                else:
+                    raw_roll = self.normalize_angle(drone_angle - 90)
+                
+                has_roll_data = True
+                self.last_roll = self.get_corrected_roll(raw_roll)
+        
+        roll = self.last_roll
+        pitch = self.last_pitch
+        
+        # ВИЗУАЛИЗАЦИЯ
+        for i, ring in enumerate(ring_candidates):
+            color = (0, 255, 0) if i < 2 else (0, 255, 255)
+            cv2.drawContours(frame, [ring['contour']], -1, color, 2)
+            cv2.circle(frame, ring['center'], ring['radius'], color, 2)
+            cv2.circle(frame, ring['center'], 30, (255, 0, 0), -1)
+            
+            info_y = ring['center'][1] - ring['radius'] - 10
+            cv2.putText(frame, f"R{i+1}: A={ring['area']:.0f}", 
+                       (ring['center'][0]-60, info_y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        
+        if len(ring_centers) >= 2:
+            cv2.line(frame, (int(ring_centers[0][0]), int(ring_centers[0][1])), 
+                    (int(ring_centers[1][0]), int(ring_centers[1][1])), (255, 0, 0), 3)
+        
+        for i, conn in enumerate(connectors):
+            cv2.circle(frame, (int(conn[0]), int(conn[1])), 10, (0, 0, 255), -1)
+            cv2.putText(frame, f"#{i+1}", (int(conn[0])-15, int(conn[1])-15),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        
+        if p1 and p2:
+            cv2.line(frame, (int(p1[0]), int(p1[1])), 
+                    (int(p2[0]), int(p2[1])), (255, 0, 255), 3)
+            center_x = (p1[0] + p2[0]) / 2
+            center_y = (p1[1] + p2[1]) / 2
+            cv2.circle(frame, (int(center_x), int(center_y)), 15, (255, 0, 255), -1)
+        
+        # ИНФОРМАЦИЯ
+        y_off = 40
+        cv2.putText(frame, f"Rings: {len(ring_centers)}/2", (10, y_off), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2); y_off += 40
+        
+        cv2.putText(frame, f"Connectors: {len(connectors)}", (10, y_off), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2); y_off += 40
+        
+        if has_pitch_data:
+            cv2.putText(frame, f"PITCH: {pitch:.1f}°", (10, y_off), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+        else:
+            cv2.putText(frame, f"PITCH: {pitch:.1f}° (last)", (10, y_off), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2)
+        y_off += 40
+        
+        if has_roll_data:
+            color = (0, 255, 0) if abs(roll) < 10 else (0, 0, 255)
+            zero_status = " [Z]" if self.roll_zero_set else ""
+            cv2.putText(frame, f"ROLL: {roll:.1f}°{zero_status}", (10, y_off), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        else:
+            cv2.putText(frame, f"ROLL: {roll:.1f}° (last)", (10, y_off), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2)
+        y_off += 50
+        
+        if self.roll_zero_set or self.pitch_zero_set:
+            status_text = "ZERO: "
+            if self.roll_zero_set:
+                status_text += "R "
+            if self.pitch_zero_set:
+                status_text += "P "
+            cv2.putText(frame, status_text, (10, y_off), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        if self.paused:
+            cv2.putText(frame, "PAUSED", (w//2 - 80, 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+        
+        if (has_roll_data or has_pitch_data) and (current_time - self.last_update_time > 0.5):
+            print(f"\n📊 [{time.strftime('%H:%M:%S')}]")
+            if has_pitch_data:
+                print(f"   PITCH: {pitch:+7.2f}°")
+            if has_roll_data:
+                print(f"   ROLL:  {roll:+7.2f}°")
+            self.last_update_time = current_time
+        
+        return frame, mask_yellow, mask_black, roll, pitch, has_roll_data, has_pitch_data
+
+
+def run(camera_index=0):
+    detector = FastDroneDetector()
+    
+    cap = cv2.VideoCapture(camera_index)
+    
+    if not cap.isOpened():
+        print(f"❌ Не удалось открыть камеру {camera_index}")
+        print("💡 Попробуйте изменить camera_index (0, 1, 2...)")
+        return
+    
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps == 0:
+        fps = 30
+    
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    print("=" * 70)
+    print("🚀 DRONE GIMBAL DETECTOR - CAMERA MODE")
+    print("=" * 70)
+    print(f"📹 Камера: {camera_index}")
+    print(f"📐 Разрешение: {width}x{height}")
+    print(f"🎬 FPS: {fps:.1f}")
+    print("=" * 70)
+    print("УПРАВЛЕНИЕ:")
+    print("  SPACE - Пауза/Продолжить")
+    print("  z - Обнулить ROLL")
+    print("  x - Обнулить PITCH")
+    print("  c - Обнулить всё")
+    print("  r - Сбросить все нули")
+    print("  q - Выход")
+    print("  s - Сохранить кадр")
+    print("=" * 70)
+    
+    frame_count = 0
+    start_time = time.time()
+    
+    while True:
+        ret, frame = cap.read()
+        
+        if not ret:
+            print("❌ Ошибка чтения кадра с камеры")
+            break
+        
+        frame_count += 1
+        
+        if not detector.paused:
+            h, w = frame.shape[:2]
+            frame_res, mask_yellow, mask_black, roll, pitch, has_roll_data, has_pitch_data = detector.process_frame(frame)
+            
+            if frame_count % 12 == 0:
+                print(f"\n📊 Frame {frame_count}:")
+                print(f"   ROLL:  {roll:+7.2f}°")
+                print(f"   PITCH: {pitch:+7.2f}°")
+                print("-" * 40)
+            
+            cv2.imshow('Result', frame_res)
+            cv2.imshow('Yellow Mask', cv2.resize(mask_yellow, (w//4, h//4)))
+            cv2.imshow('Black Mask (Rings)', cv2.resize(mask_black, (w//4, h//4)))
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == 32:
+            detector.paused = not detector.paused
+            status = "⏸️ PAUSE" if detector.paused else "▶️ PLAY"
+            print(f"{status}")
+        elif key == ord('z'):
+            if 'has_roll_data' in locals() and has_roll_data:
+                detector.set_zero_roll(roll)
+            else:
+                print("⚠️  НЕВОЗМОЖНО: нет данных для обнуления ROLL")
+        elif key == ord('x'):
+            if 'has_pitch_data' in locals() and has_pitch_data:
+                detector.set_zero_pitch(pitch)
+            else:
+                print("⚠️  НЕВОЗМОЖНО: нет данных для обнуления PITCH")
+        elif key == ord('c'):
+            if 'has_roll_data' in locals() and has_roll_data:
+                detector.set_zero_roll(roll)
+            if 'has_pitch_data' in locals() and has_pitch_data:
+                detector.set_zero_pitch(pitch)
+            print("✅ ВСЕ НУЛИ УСТАНОВЛЕНЫ")
+        elif key == ord('r'):
+            detector.zero_roll = 0.0
+            detector.zero_pitch = 0.0
+            detector.roll_zero_set = False
+            detector.pitch_zero_set = False
+            print("🔄 ВСЕ НУЛИ СБРОШЕНЫ")
+        elif key == ord('s'):
+            filename = f'camera_frame_{frame_count:05d}.png'
+            if 'frame_res' in locals():
+                cv2.imwrite(filename, frame_res)
+                print(f"💾 Saved: {filename}")
+    
+    cap.release()
+    cv2.destroyAllWindows()
+    
+    elapsed = time.time() - start_time
+    fps_actual = frame_count / elapsed if elapsed > 0 else 0
+    print(f"\n{'=' * 70}")
+    print(f"Обработано кадров: {frame_count}")
+    print(f"Время: {elapsed:.2f} сек, FPS: {fps_actual:.1f}")
+    print(f"{'=' * 70}")
+
+
+if __name__ == "__main__":
+    run(camera_index=0)
