@@ -1,0 +1,194 @@
+import cv2
+import numpy as np
+from pioneer_sdk import Camera
+
+# Параметры голубого цвета (HSV) - фиксированные (настраиваются клавишами)
+h_min, h_max = 58, 139
+s_min, s_max = 63, 255
+v_min, v_max = 39, 255
+
+# Параметры фильтрации по площади для голубого
+blue_min_area = 500
+blue_max_area = 50000
+
+# Параметры чёрного цвета (теперь тоже глобальные переменные, настраиваются клавишами)
+black_v_max = 71
+black_min_area = 2857
+black_max_area = 46359
+
+
+def main():
+    # ✅ ОБЯЗАТЕЛЬНО: объявляем глобальные переменные для изменения внутри функции
+    global h_min, h_max, s_min, s_max, v_min, v_max
+    global blue_min_area, blue_max_area
+    global black_v_max, black_min_area, black_max_area
+
+    # Инициализация камеры дрона
+    print("Подключение к камере дрона Pioneer...")
+    camera = Camera()
+
+    try:
+        camera.connect()
+        print("Успешное подключение к камере дрона!")
+    except Exception as e:
+        print(f"ОШИБКА: Не удалось подключиться к камере дрона: {e}")
+        print("Убедитесь, что дрон включен и находится в сети 192.168.4.1")
+        return
+
+    print("\nДетектор голубого и чёрного цвета (камера дрона)")
+    print("=" * 50)
+    print("1/2 - H min/max (голубой)")
+    print("3/4 - S min/max (голубой)")
+    print("5/6 - V min/max (голубой)")
+    print("7/8 - Площадь min/max (голубой)")
+    print("9/0 - V max (чёрный)")
+    print("-/= - Площадь min/max (чёрный)")
+    print("S - сохранить маски, Q - выход")
+    print("=" * 50)
+
+    # Создаём основное окно для отображения результата
+    cv2.namedWindow("Result", cv2.WINDOW_NORMAL)
+
+    try:
+        while True:
+            # Получение кадра с камеры дрона
+            frame = camera.get_cv_frame()
+
+            if frame is None:
+                print("Ошибка получения кадра с камеры дрона")
+                continue
+
+            # Перевод в HSV для голубого цвета
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+            # === ГОЛУБОЙ ДЕТЕКТОР (HSV) ===
+            lower_blue = np.array([h_min, s_min, v_min], dtype=np.uint8)
+            upper_blue = np.array([h_max, s_max, v_max], dtype=np.uint8)
+            mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
+
+            kernel = np.ones((5, 5), np.uint8)
+            mask_blue = cv2.morphologyEx(mask_blue, cv2.MORPH_OPEN, kernel)
+            mask_blue = cv2.morphologyEx(mask_blue, cv2.MORPH_CLOSE, kernel)
+
+            # === ЧЁРНЫЙ ДЕТЕКТОР (порог по яркости) ===
+            # Используем глобальные переменные напрямую (трекбары удалены)
+
+            # Конвертируем в оттенки серого
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            # Чёрный = очень низкая яркость
+            _, mask_black = cv2.threshold(gray, black_v_max, 255, cv2.THRESH_BINARY_INV)
+
+            # Морфологические операции для чёрного
+            mask_black = cv2.morphologyEx(mask_black, cv2.MORPH_OPEN, kernel)
+            mask_black = cv2.morphologyEx(mask_black, cv2.MORPH_CLOSE, kernel)
+
+            # === ОБРАБОТКА КОНТУРОВ ===
+            frame_with_boxes = frame.copy()
+            blue_count = 0
+            black_count = 0
+
+            # Голубые объекты (зелёная рамка)
+            contours_blue, _ = cv2.findContours(mask_blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours_blue:
+                area = cv2.contourArea(contour)
+                if blue_min_area < area < blue_max_area:
+                    # Вычисление центра масс
+                    M = cv2.moments(contour)
+                    if M["m00"] != 0:
+                        cX = int(M["m10"] / M["m00"])
+                        cY = int(M["m01"] / M["m00"])
+                        # Рисуем центр массы (белая точка)
+                        cv2.circle(frame_with_boxes, (cX, cY), 7, (255, 255, 255), -1)
+
+                    x, y, w, h = cv2.boundingRect(contour)
+                    cv2.rectangle(frame_with_boxes, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    cv2.putText(frame_with_boxes, f'B:{int(area)}', (x, y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    blue_count += 1
+
+        # Чёрные объекты (красная рамка)
+            contours_black, _ = cv2.findContours(mask_black, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours_black:
+                area = cv2.contourArea(contour)
+                if black_min_area < area < black_max_area:
+                    # Вычисление центра масс
+                    M = cv2.moments(contour)
+                    if M["m00"] != 0:
+                        cX = int(M["m10"] / M["m00"])
+                        cY = int(M["m01"] / M["m00"])
+                        # Рисуем центр массы (белая точка)
+                        cv2.circle(frame_with_boxes, (cX, cY), 7, (255, 255, 255), -1)
+
+                    x, y, w, h = cv2.boundingRect(contour)
+                    cv2.rectangle(frame_with_boxes, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                    cv2.putText(frame_with_boxes, f'K:{int(area)}', (x, y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                    black_count += 1
+
+        # Комбинированная маска (оставлена для возможности сохранения через 'S')
+            mask_combined = cv2.bitwise_or(mask_blue, mask_black)
+            result = cv2.bitwise_and(frame, frame, mask=mask_combined)
+
+            # Информация о параметрах
+            info_text = [
+                f'Blue: {blue_count} objects',
+                f'Black: {black_count} objects',
+                f'Black V Max: {black_v_max}',
+                f'Blue H: {h_min}-{h_max}'
+            ]
+
+            y_offset = 30
+            for text in info_text:
+                cv2.putText(frame_with_boxes, text, (10, y_offset),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                y_offset += 30
+
+            # Отображение только основного окна (окна масок удалены)
+            cv2.imshow("Result", frame_with_boxes)
+
+            # Обработка клавиш
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord('q'):
+                break
+            elif key == ord('1'):
+                h_min = max(0, h_min - 1)
+            elif key == ord('2'):
+                h_max = min(179, h_max + 1)
+            elif key == ord('3'):
+                s_min = max(0, s_min - 1)
+            elif key == ord('4'):
+                s_max = min(255, s_max + 1)
+            elif key == ord('5'):
+                v_min = max(0, v_min - 1)
+            elif key == ord('6'):
+                v_max = min(255, v_max + 1)
+            elif key == ord('7'):
+                blue_min_area = max(100, blue_min_area - 100)
+            elif key == ord('8'):
+                blue_max_area = min(100000, blue_max_area + 1000)
+            elif key == ord('9'):
+                black_v_max = max(10, black_v_max - 1)
+            elif key == ord('0'):
+                black_v_max = min(100, black_v_max + 1)
+            elif key == 45:  # Клавиша "-"
+                black_min_area = max(50, black_min_area - 50)
+            elif key == 61:  # Клавиша "="
+                black_max_area = min(100000, black_max_area + 500)
+            elif key == ord('s') or key == ord('S'):
+                cv2.imwrite('mask_blue.png', mask_blue)
+                cv2.imwrite('mask_black.png', mask_black)
+                cv2.imwrite('result.png', result)
+                cv2.imwrite('with_boxes.png', frame_with_boxes)
+                print("Скриншоты сохранены!")
+
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем")
+    finally:
+        camera.disconnect()
+        cv2.destroyAllWindows()
+        print("Программа завершена")
+
+if __name__ == "__main__":
+    main()
