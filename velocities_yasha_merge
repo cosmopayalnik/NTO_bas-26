@@ -1,0 +1,55 @@
+import time
+import math
+from pioneer_sdk import Pioneer
+
+
+def get_wind_speed_from_optical_flow(drone: Pioneer) -> float | None:
+    # По доке: get_optical_data(get_last_received=True) -> dict | None :contentReference[oaicite:2]{index=2}
+    data = drone.get_optical_data(get_last_received=True)
+    if data is None:
+        return None
+
+    # В зависимости от прошивки/сообщений ключи могут отличаться.
+    # Обычно используются vx/vy (м/с). Если ключей нет — вернём None.
+    vx = data.get("vx", None)
+    vy = data.get("vy", None)
+    if vx is None or vy is None:
+        return None
+
+    return math.sqrt(vx * vx + vy * vy)
+
+
+def main():
+    drone = Pioneer()
+
+    try:
+        # arm/takeoff по доке возвращают bool :contentReference[oaicite:3]{index=3}
+        if not drone.arm():
+            print("arm() не выполнился")
+            return
+
+        if not drone.takeoff():
+            print("takeoff() не выполнился")
+            return
+
+        time.sleep(2)  # стабилизация
+
+        while True:
+            wind_speed = get_wind_speed_from_optical_flow(drone)
+            if wind_speed is not None:
+                print(f"Оценка ветра (горизонтальная скорость): {wind_speed:.2f} м/с")
+            else:
+                print("Нет новых данных оптического потока")
+            time.sleep(0.5)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # land/disarm по доке тоже bool :contentReference[oaicite:4]{index=4}
+        drone.land()
+        time.sleep(3)
+        drone.disarm()
+
+
+if __name__ == "__main__":
+    main()
