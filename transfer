@@ -11,6 +11,7 @@ ATTEMPT_NUM = 1
 FLIGHT_HEIGHT = 1.5
 WIND_MEASURE_TIME = 3.0
 FLIGHT_SPEED = 0.5
+SHOW_CAMERA_DURING_FLIGHT = True  # Показывать камеру во время полёта
 # ================================================================
 
 # ================= ПАРАМЕТРЫ ЦВЕТОВ =================
@@ -19,8 +20,6 @@ s_min, s_max = 63, 255
 v_min, v_max = 39, 255
 blue_min_area = 500
 blue_max_area = 50000
-
-
 # ================================================================
 
 class AutonomousMission:
@@ -32,18 +31,19 @@ class AutonomousMission:
         self.current_y = 0.0
         self.current_z = 0.0
         self.current_yaw = 0.0
-
+        self.camera_connected = False
+        
     def fly_to_point(self, x, y, z, yaw=None):
         """Полёт в локальную точку"""
         if yaw is None:
             yaw = self.current_yaw
-
+            
         print(f"🚀 Полёт: x={x:.2f}, y={y:.2f}, z={z:.2f}, yaw={yaw}")
         self.drone.go_to_local_point(x=x, y=y, z=z, yaw=yaw)
-
+        
         while not self.drone.point_reached():
             time.sleep(0.1)
-
+        
         print("✅ Точка достигнута")
         self.current_x = x
         self.current_y = y
@@ -57,15 +57,15 @@ class AutonomousMission:
         lower_blue = np.array([h_min, s_min, v_min], dtype=np.uint8)
         upper_blue = np.array([h_max, s_max, v_max], dtype=np.uint8)
         mask = cv2.inRange(hsv, lower_blue, upper_blue)
-
+        
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel)
-
+        
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
+        
         if not contours:
             return None, mask
-
+            
         for contour in contours:
             area = cv2.contourArea(contour)
             if blue_min_area < area < blue_max_area:
@@ -74,104 +74,133 @@ class AutonomousMission:
                     cX = int(M["m10"] / M["m00"])
                     cY = int(M["m01"] / M["m00"])
                     return (cX, cY, area), mask
-
+                    
         return None, mask
-
+    
     def get_lateral_wind_speed(self, duration):
         """Замер бокового ветра"""
         print(f"🌬 Замер ветра ({duration} сек)...")
         vy_samples = []
         start_time = time.time()
-
+        
         while time.time() - start_time < duration:
-            data = self.drone.get_optical_data(get_last_received=True)
-            if data is not None:
-                vy = data.get("vy", 0.0)
+            optical_data = self.drone.get_optical_data(get_last_received=True)
+            if optical_data is not None:
+                vy = optical_data.get("vy", 0.0)
                 if vy is not None:
                     vy_samples.append(abs(vy))
             time.sleep(0.1)
-
+        
         return sum(vy_samples) / len(vy_samples) if vy_samples else 0.0
-
+    
     def save_wind_result(self, speed):
-        """Сохранение результата"""
+        """Сохранение результата в директорию программы"""
+        # ✅ Просто имя файла - сохранится в папке со скриптом
         filename = f"{TEAM_NAME}_speed_{ATTEMPT_NUM}.txt"
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(f"speed_wind = {speed:.2f} m/s\n")
-        print(f"✅ Сохранено: {filename}")
+        
+        try:
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(f"speed_wind = {speed:.2f} m/s\n")
+            
+            # Проверка записи
+            with open(filename, "r", encoding="utf-8") as f:
+                content = f.read()
+            
+            print(f"✅ Сохранено: {filename}")
+            print(f"   Содержимое: {content.strip()}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ ОШИБКА ЗАПИСИ: {e}")
+            return False
+
+    def show_camera_feed(self, title="Camera"):
+        """Отображение видеопотока (неблокирующее)"""
+        if not self.camera_connected:
+            return
+            
+        frame = self.camera.get_cv_frame()
+        if frame is not None:
+            h, w = frame.shape[:2]
+            cv2.putText(frame, f'Pos: ({self.current_x:.2f}, {self.current_y:.2f})', 
+                       (10, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.imshow(title, frame)
+            cv2.waitKey(1)
 
     def align_and_land(self, timeout=40):
-        """Выравнивание по кресту и посадка с визуализацией"""
+        """Выравнивание по кресту и посадка"""
         print("🎯 Поиск креста и точная посадка...")
-        self.camera.connect()
+        
+        if not self.camera_connected:
+            self.camera.connect()
+            self.camera_connected = True
+            
         start_time = time.time()
         aligned = False
-
+        
         while time.time() - start_time < timeout:
             frame = self.camera.get_cv_frame()
             if frame is None:
                 continue
-
+            
             cross_pos, mask_blue = self.detect_blue_cross(frame)
             h, w = frame.shape[:2]
             center_x, center_y = w // 2, h // 2
-
+            
             # === ВИЗУАЛИЗАЦИЯ ===
             cv2.line(frame, (center_x - 15, center_y), (center_x - 5, center_y), (0, 255, 0), 2)
             cv2.line(frame, (center_x + 5, center_y), (center_x + 15, center_y), (0, 255, 0), 2)
             cv2.line(frame, (center_x, center_y - 15), (center_x, center_y - 5), (0, 255, 0), 2)
             cv2.line(frame, (center_x, center_y + 5), (center_x, center_y + 15), (0, 255, 0), 2)
-
+            
             if cross_pos:
                 cX, cY, area = cross_pos
-
+                
                 cv2.circle(frame, (cX, cY), 10, (0, 0, 255), 2)
                 cv2.circle(frame, (cX, cY), 3, (0, 0, 255), -1)
                 cv2.line(frame, (center_x, center_y), (cX, cY), (255, 0, 0), 2)
-
+                
                 error_x = cX - center_x
                 error_y = cY - center_y
                 cv2.putText(frame, f'Cross: {area}px^2', (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 cv2.putText(frame, f'Error: X={error_x:+d} Y={error_y:+d}', (10, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                
                 if abs(error_x) < 25 and abs(error_y) < 25:
                     cv2.putText(frame, 'ALIGNED', (10, 90),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                     aligned = True
                     break
                 else:
                     k = 0.0012
                     move_x = error_x * k
                     move_y = error_y * k
-
+                    
                     move_x = np.clip(move_x, -0.3, 0.3)
                     move_y = np.clip(move_y, -0.3, 0.3)
-
+                    
                     new_x = self.current_x + move_x
                     new_y = self.current_y + move_y
-
+                    
                     print(f"🔄 Коррекция: dx={move_x:.3f}, dy={move_y:.3f}")
                     self.fly_to_point(new_x, new_y, self.current_z, self.current_yaw)
             else:
                 cv2.putText(frame, 'Cross NOT FOUND', (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                time.sleep(0.3)
-
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            
             cv2.imshow("Landing Camera", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-
+        
         cv2.destroyAllWindows()
-        self.camera.disconnect()
-
+        
         if not aligned:
             print("⚠️ Не удалось выровняться, посадка по текущей позиции")
-
+        
         print("⬇️ Снижение...")
         self.fly_to_point(self.current_x, self.current_y, 0.0, self.current_yaw)
-
+        
         self.drone.land()
         time.sleep(3)
         self.drone.disarm()
@@ -181,24 +210,41 @@ class AutonomousMission:
         """Полный цикл миссии"""
         try:
             print("🔌 Подключение...")
-
+            
+            # ✅ ПОДКЛЮЧАЕМ КАМЕРУ СРАЗУ
+            if SHOW_CAMERA_DURING_FLIGHT:
+                print("📹 Подключение камеры...")
+                self.camera.connect()
+                self.camera_connected = True
+            
             if not self.drone.arm():
                 print("❌ Ошибка арминга")
                 return
             if not self.drone.takeoff():
                 print("❌ Ошибка взлёта")
                 return
-
+            
             time.sleep(2)
-
+            
             self.fly_to_point(0, 0, FLIGHT_HEIGHT, 0)
-
+            
+            # Показываем камеру во время замера ветра
+            if SHOW_CAMERA_DURING_FLIGHT:
+                self.show_camera_feed("Flight Camera")
+            
             wind_speed = self.get_lateral_wind_speed(WIND_MEASURE_TIME)
             print(f"🌬 Ветер: {wind_speed:.2f} м/с")
-            self.save_wind_result(wind_speed)
-
+            
+            # ✅ ПРОВЕРЯЕМ СОХРАНЕНИЕ
+            if not self.save_wind_result(wind_speed):
+                print("⚠️ Ветер не сохранён, но продолжаем миссию")
+            
             print("\n🏁 Челночный пролёт (по оси Y)...")
-
+            
+            # Показываем камеру во время полёта
+            if SHOW_CAMERA_DURING_FLIGHT:
+                self.show_camera_feed("Flight Camera")
+            
             self.fly_to_point(0, 0.3, FLIGHT_HEIGHT, 0)
             time.sleep(1)
             self.fly_to_point(0, 2.2, FLIGHT_HEIGHT, 0)
@@ -207,15 +253,16 @@ class AutonomousMission:
             time.sleep(1)
             self.fly_to_point(0, 2.2, FLIGHT_HEIGHT, 0)
             time.sleep(1)
-
+            
             print("\n🎯 Возврат в центр для посадки...")
-
+            
             self.fly_to_point(0, 1.1, FLIGHT_HEIGHT, 0)
-
+            
+            # Посадка с камерой
             self.align_and_land()
-
+            
             print("✅ Миссия завершена успешно!")
-
+            
         except KeyboardInterrupt:
             print("\n⚠️ Прервано пользователем")
             self.drone.land()
@@ -226,6 +273,11 @@ class AutonomousMission:
             self.drone.land()
             time.sleep(3)
             self.drone.disarm()
+        finally:
+            # ✅ ОТКЛЮЧАЕМ КАМЕРУ В КОНЦЕ
+            if self.camera_connected:
+                self.camera.disconnect()
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
