@@ -6,11 +6,11 @@ import os
 from pioneer_sdk import Pioneer, Camera
 
 # ================= НАСТРОЙКИ МИССИИ =================
-TEAM_NAME = "MyTeam"       # Название команды
-ATTEMPT_NUM = 1            # Номер попытки
-FLIGHT_HEIGHT = 1.5        # Высота полёта (м)
-WIND_MEASURE_TIME = 3.0    # Время замера ветра (сек)
-FLIGHT_SPEED = 0.5         # Скорость полёта (м/с)
+TEAM_NAME = "MyTeam"  # Название команды
+ATTEMPT_NUM = 1  # Номер попытки
+FLIGHT_HEIGHT = 1.5  # Высота полёта (м)
+WIND_MEASURE_TIME = 3.0  # Время замера ветра (сек)
+FLIGHT_SPEED = 0.5  # Скорость полёта (м/с)
 # ================================================================
 
 # ================= ПАРАМЕТРЫ ЦВЕТОВ =================
@@ -22,6 +22,8 @@ v_min, v_max = 39, 255
 # Параметры фильтрации
 blue_min_area = 500
 blue_max_area = 50000
+
+
 # ================================================================
 
 class AutonomousMission:
@@ -33,19 +35,19 @@ class AutonomousMission:
         self.current_y = 0.0
         self.current_z = 0.0
         self.current_yaw = 0.0
-        
+
     def fly_to_point(self, x, y, z, yaw=None):
         """Полёт в локальную точку относительно взлёта"""
         if yaw is None:
             yaw = self.current_yaw
-            
+
         print(f"🚀 Полёт: x={x:.2f}, y={y:.2f}, z={z:.2f}, yaw={yaw}")
-        
+
         self.drone.go_to_local_point(x=x, y=y, z=z, yaw=yaw)
-        
+
         while not self.drone.point_reached():
             time.sleep(0.1)
-        
+
         print("✅ Точка достигнута")
         self.current_x = x
         self.current_y = y
@@ -59,15 +61,15 @@ class AutonomousMission:
         lower_blue = np.array([h_min, s_min, v_min], dtype=np.uint8)
         upper_blue = np.array([h_max, s_max, v_max], dtype=np.uint8)
         mask = cv2.inRange(hsv, lower_blue, upper_blue)
-        
+
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel)
-        
+
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
+
         if not contours:
             return None, mask
-            
+
         for contour in contours:
             area = cv2.contourArea(contour)
             if blue_min_area < area < blue_max_area:
@@ -76,15 +78,15 @@ class AutonomousMission:
                     cX = int(M["m10"] / M["m00"])
                     cY = int(M["m01"] / M["m00"])
                     return (cX, cY, area), mask
-                    
+
         return None, mask
-    
+
     def get_lateral_wind_speed(self, duration):
         """Замер бокового ветра через оптический поток"""
         print(f"🌬 Замер ветра ({duration} сек)...")
         vy_samples = []
         start_time = time.time()
-        
+
         while time.time() - start_time < duration:
             data = self.drone.get_optical_data(get_last_received=True)
             if data:  # ✅ ИСПРАВЛЕНО: добавлено условие
@@ -92,11 +94,11 @@ class AutonomousMission:
                 if vy is not None:
                     vy_samples.append(abs(vy))
             time.sleep(0.1)
-        
+
         if not vy_samples:
             return 0.0
         return sum(vy_samples) / len(vy_samples)
-    
+
     def save_wind_result(self, speed):
         """Сохранение результата в файл"""
         filename = f"{TEAM_NAME}_speed_{ATTEMPT_NUM}.txt"
@@ -109,25 +111,25 @@ class AutonomousMission:
         print("🎯 Поиск креста и точная посадка...")
         self.camera.connect()
         start_time = time.time()
-        
+
         while time.time() - start_time < timeout:
             frame = self.camera.get_cv_frame()
             if frame is None:
                 continue
-            
+
             cross_pos, mask_blue = self.detect_blue_cross(frame)
             h, w = frame.shape[:2]
             center_x, center_y = w // 2, h // 2
-            
+
             cv2.circle(frame, (center_x, center_y), 5, (0, 255, 0), -1)
-            
+
             if cross_pos:
                 cX, cY, area = cross_pos
                 cv2.circle(frame, (cX, cY), 7, (0, 0, 255), -1)
-                
+
                 error_x = cX - center_x
                 error_y = cY - center_y
-                
+
                 if abs(error_x) < 25 and abs(error_y) < 25:
                     print(f"✅ Выровнено! Ошибка: {error_x}, {error_y}")
                     break
@@ -135,26 +137,26 @@ class AutonomousMission:
                     k = 0.001
                     move_x = -error_x * k
                     move_y = error_y * k
-                    
+
                     new_x = self.current_x + move_x
                     new_y = self.current_y + move_y
-                    
+
                     print(f"🔄 Коррекция: dx={move_x:.3f}, dy={move_y:.3f}")
                     self.fly_to_point(new_x, new_y, self.current_z, self.current_yaw)
             else:
                 print("⚠️ Крест не найден")
                 time.sleep(0.5)
-            
+
             cv2.imshow("Landing Camera", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-        
+
         cv2.destroyAllWindows()
         self.camera.disconnect()
-        
+
         print("⬇️ Снижение...")
         self.fly_to_point(self.current_x, self.current_y, 0.0, self.current_yaw)
-        
+
         self.drone.land()
         time.sleep(3)
         self.drone.disarm()
@@ -164,36 +166,38 @@ class AutonomousMission:
         """Полный цикл миссии"""
         try:
             print("🔌 Подключение...")
-            
+
             if not self.drone.arm():
                 print("❌ Ошибка арминга")
                 return
             if not self.drone.takeoff():
                 print("❌ Ошибка взлёта")
                 return
-            
+
             time.sleep(2)
-            
-            self.fly_to_point(0, 0, FLIGHT_HEIGHT, 0)
-            
+
+            self.fly_to_point(0, 0.5, FLIGHT_HEIGHT, 0)
+
             wind_speed = self.get_lateral_wind_speed(WIND_MEASURE_TIME)
             print(f"🌬 Ветер: {wind_speed:.2f} м/с")
             self.save_wind_result(wind_speed)
-            
+
             print("\n🏁 Челночный пролёт...")
-            
-            self.fly_to_point(2.5, 0, FLIGHT_HEIGHT, 0)
+
+            self.fly_to_point(0.0, 2.2, FLIGHT_HEIGHT, 0)
+            time.sleep(4)
             self.fly_to_point(0.0, 0, FLIGHT_HEIGHT, 0)
-            self.fly_to_point(2.5, 0, FLIGHT_HEIGHT, 0)
-            
+            time.sleep(4)
+            self.fly_to_point(0.0, 2.2, FLIGHT_HEIGHT, 0)
+
             print("\n🎯 Возврат в центр для посадки...")
-            
+
             self.fly_to_point(1.25, 0, FLIGHT_HEIGHT, 0)
-            
+
             self.align_and_land()
-            
+
             print("✅ Миссия завершена успешно!")
-            
+
         except KeyboardInterrupt:
             print("\n⚠️ Прервано пользователем")
             self.drone.land()
